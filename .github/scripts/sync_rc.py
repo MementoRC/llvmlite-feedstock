@@ -38,7 +38,13 @@ from pathlib import Path
 # bump_rc.py lives beside this file; reuse its tested recipe-editing helpers
 # rather than maintaining a second implementation.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bump_rc import patch_context_scalar, patch_inline_sha256, read_current_version, _emit  # noqa: E402
+from bump_rc import (  # noqa: E402
+    patch_context_scalar,
+    patch_inline_sha256,
+    read_current_version,
+    _context_lines,
+    _emit,
+)
 
 DEFAULT_RECIPE = "recipe/recipe.yaml"
 DEFAULT_THEIRS = "README.md"
@@ -114,15 +120,23 @@ def cmd_capture(args):
         print("error: could not find version in context: block", file=sys.stderr)
         return 2
 
-    sha256 = None
+    # build_number is looked up in the context: block ONLY, so capture and
+    # patch_context_scalar agree on scope. A build_number declared elsewhere
+    # would otherwise be captured but un-patchable, firing the resolve-time
+    # guard spuriously.
     build_number = None
+    for _, line in _context_lines(lines):
+        m = re.match(r'^\s*build_number:\s*"?([0-9]+)"?\s*$', line)
+        if m:
+            build_number = m.group(1)
+            break
+
+    sha256 = None
     for line in lines:
         m = re.match(r'^\s*sha256:\s*"?([0-9a-f]{64})"?\s*$', line)
-        if m and sha256 is None:
+        if m:
             sha256 = m.group(1)
-        m = re.match(r'^\s*build_number:\s*"?([0-9]+)"?\s*$', line)
-        if m and build_number is None:
-            build_number = m.group(1)
+            break
 
     identity = {"version": version, "sha256": sha256, "build_number": build_number}
     Path(args.out).write_text(json.dumps(identity, indent=2))
@@ -158,25 +172,49 @@ def cmd_resolve(args):
     if recipe.exists():
         lines = recipe.read_text().splitlines(keepends=True)
         notes = []
-        if identity.get("version") and patch_context_scalar(
-            lines, "version", identity["version"]
-        ):
-            notes.append("version")
-        if identity.get("build_number") and patch_context_scalar(
-            lines, "build_number", identity["build_number"]
-        ):
-            notes.append("build_number")
+        failed = []
+
+        if identity.get("version"):
+            if patch_context_scalar(lines, "version", identity["version"]):
+                notes.append("version")
+            else:
+                failed.append("version")
+
+        if identity.get("build_number"):
+            if patch_context_scalar(lines, "build_number", identity["build_number"]):
+                notes.append("build_number")
+            else:
+                failed.append("build_number")
+
         if identity.get("sha256"):
             # numba carries sha256 as a context: key, llvmlite inline under
-            # source:. Try both; at least one applies per feedstock.
-            if patch_context_scalar(lines, "sha256", identity["sha256"]):
-                notes.append("sha256(context)")
-            if patch_inline_sha256(
+            # source:. Exactly one applies per feedstock, so require one hit.
+            ctx = patch_context_scalar(lines, "sha256", identity["sha256"])
+            inline = patch_inline_sha256(
                 lines, ["pypi.org/packages/source", ".tar.gz"], identity["sha256"]
-            ):
+            )
+            if ctx:
+                notes.append("sha256(context)")
+            if inline:
                 notes.append("sha256(inline)")
+            if not (ctx or inline):
+                failed.append("sha256")
+
         if template_distinfo_glob(lines, args.package):
             notes.append("dist-info glob")
+
+        if failed:
+            # Fail loudly rather than shipping main's identity onto rc: the
+            # result would be a buildable recipe publishing the wrong version
+            # under the rc label. Bail BEFORE writing the file.
+            print(
+                "error: captured rc identity could not be re-injected: "
+                + ", ".join(failed)
+                + " -- refusing to continue",
+                file=sys.stderr,
+            )
+            return 1
+
         recipe.write_text("".join(lines))
         print(f"re-injected rc identity: {', '.join(notes) or 'nothing to do'}")
         if recipe_path not in resolved:
