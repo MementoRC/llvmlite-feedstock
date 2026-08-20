@@ -1,0 +1,167 @@
+name: RC sync from upstream main
+
+# Keeps the long-lived `rc` branch's framework in step with conda-forge's
+# `main`, so a new 0.NN.0rc starts from the same recipe scaffolding as main.
+#
+# Detection is a cron poll, not a push trigger: a `push` event reads the
+# workflow file from the pushed branch (which lives on conda-forge, not here),
+# and `schedule` only fires from a repo's default branch. Polling upstream is
+# the only option that keeps this scaffold private to the fork.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Resolve and print the diff, but do not push or open a PR'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE: llvmlite
+  REPO: MementoRC/llvmlite-feedstock
+  UPSTREAM: conda-forge/llvmlite-feedstock
+  RC_BRANCH: rc
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch (for the sync scripts)
+        uses: actions/checkout@v4
+        with:
+          path: scaffold
+
+      - name: Checkout the fork (working tree for the merge)
+        uses: actions/checkout@v4
+        with:
+          path: rc
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The fork's own rc ref lags upstream's whenever a sync PR is merged on
+      # conda-forge, so every ref this job reasons about comes from upstream.
+      - name: Fetch upstream and pin the working tree to upstream/rc
+        working-directory: rc
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch upstream main rc --no-tags
+          git checkout -B "$RC_BRANCH" upstream/rc
+          echo "MAIN_SHA=$(git rev-parse --short upstream/main)" >> "$GITHUB_ENV"
+
+      - name: Skip if upstream/main is already contained in rc
+        id: guard
+        working-directory: rc
+        run: |
+          if git merge-base --is-ancestor upstream/main upstream/rc; then
+            echo "rc already contains upstream/main - nothing to sync"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip if a sync PR for this commit is already open
+        id: existing
+        if: steps.guard.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CF_FEEDSTOCK_PAT }}
+        run: |
+          COUNT=$(gh pr list --repo "$UPSTREAM" --base "$RC_BRANCH" \
+                    --head "sync-main-to-rc/${MAIN_SHA}" \
+                    --state open --json number --jq 'length')
+          echo "open=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Capture rc identity before merging
+        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0'
+        working-directory: rc
+        run: |
+          python3 "${GITHUB_WORKSPACE}/scaffold/.github/scripts/sync_rc.py" capture \
+            --recipe recipe/recipe.yaml \
+            --out "${RUNNER_TEMP}/rc-identity.json"
+
+      - name: Merge upstream/main
+        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0'
+        working-directory: rc
+        run: |
+          git config user.name "rc-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git checkout -b "sync-main-to-rc/${MAIN_SHA}"
+          git merge --no-commit --no-ff upstream/main || true
+
+      - name: Resolve conflicts
+        id: resolve
+        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0'
+        working-directory: rc
+        run: |
+          python3 "${GITHUB_WORKSPACE}/scaffold/.github/scripts/sync_rc.py" resolve \
+            --recipe recipe/recipe.yaml \
+            --identity "${RUNNER_TEMP}/rc-identity.json" \
+            --package "$PACKAGE"
+
+      - name: Dry run - show what would be committed
+        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0' && inputs.dry_run
+        working-directory: rc
+        run: |
+          git diff --cached --stat
+          git diff --cached
+
+      - name: Commit, push and open the PR
+        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0' && !inputs.dry_run
+        working-directory: rc
+        env:
+          GH_TOKEN: ${{ secrets.CF_FEEDSTOCK_PAT }}
+          CONFLICTED: ${{ steps.resolve.outputs.conflicted }}
+          UNRESOLVED: ${{ steps.resolve.outputs.unresolved }}
+        run: |
+          BRANCH="sync-main-to-rc/${MAIN_SHA}"
+          OWNER="${REPO%%/*}"
+
+          # An unresolved conflict leaves markers in the tree. Skip CI rather
+          # than burn 30 build lanes on a recipe that cannot parse; the draft
+          # PR still shows the conflict in its diff.
+          if [ "$CONFLICTED" = "true" ]; then
+            SKIP=" [ci skip]"
+            DRAFT="--draft"
+            NOTE="
+
+          > **Unresolved conflicts** in: \`${UNRESOLVED}\`
+          > Committed with \`[ci skip]\`; resolve these before marking ready."
+          else
+            SKIP=""
+            DRAFT=""
+            NOTE=""
+          fi
+
+          git add -A
+          git commit -m "Sync conda-forge:main (${MAIN_SHA}) into rc${SKIP}" \
+                     -m "Automated by .github/workflows/rc-sync.yml on ${REPO}'s default branch."
+
+          git remote set-url --push upstream "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git push --force upstream "HEAD:refs/heads/${BRANCH}"
+
+          gh pr create $DRAFT \
+            --repo "$UPSTREAM" \
+            --base "$RC_BRANCH" \
+            --head "${OWNER}:${BRANCH}" \
+            --title "[rc] Sync conda-forge:main (${MAIN_SHA}) into rc" \
+            --body "Automated sync of \`conda-forge:main\` into \`rc\`, so the rc branch keeps the same recipe framework as main.
+
+          Merged \`upstream/main@${MAIN_SHA}\` into \`upstream/rc\`.
+
+          rc identity is re-applied after the merge and is **not** taken from main:
+          - \`context.version\` and its \`sha256\` (bumped separately by \`rc-bump.yml\`)
+          - \`build_number\`
+          - \`recipe/conda_build_config.yaml\` (\`channel_targets: conda-forge llvmlite_rc\`)
+
+          The head branch lives only on \`${REPO}\`; nothing is created on \`${UPSTREAM}\`.${NOTE}" \
+            || echo "PR create skipped (may already exist)"
