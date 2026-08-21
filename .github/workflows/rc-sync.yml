@@ -114,6 +114,31 @@ jobs:
             --identity "${RUNNER_TEMP}/rc-identity.json" \
             --package "$PACKAGE"
 
+      # Generated files were resolved whole-file to upstream above; the rerender
+      # now regenerates them from conda-forge.yml + the recipe, which is what
+      # makes those conflicts harmless rather than something to hand-merge.
+      - name: Set up conda for rerender
+        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0'
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          activate-environment: smithy
+          auto-activate-base: false
+
+      - name: Rerender with conda-smithy
+        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0'
+        working-directory: rc
+        shell: bash -el {0}
+        run: |
+          conda install -y -q -c conda-forge conda-smithy
+          # `conda smithy` is a conda SUBCOMMAND PLUGIN, discovered only from
+          # the env conda itself lives in (base). This installs into the
+          # activated `smithy` env, so base's conda cannot see it and errors
+          # with "invalid choice: 'smithy'". The standalone console script is
+          # on PATH in the active env and is the same entry point.
+          conda-smithy rerender --no-check-uptodate
+          git add -A
+
       - name: Dry run - show what would be committed
         if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0' && inputs.dry_run
         working-directory: rc

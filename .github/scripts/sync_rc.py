@@ -28,6 +28,7 @@ cleanly -- which would drop rc-only recipe fixes. Content outside conflict
 markers is preserved verbatim.
 """
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -49,6 +50,7 @@ from bump_rc import (  # noqa: E402
 DEFAULT_RECIPE = "recipe/recipe.yaml"
 DEFAULT_THEIRS = "README.md"
 DEFAULT_OURS = "recipe/conda_build_config.yaml"
+DEFAULT_REGENERATED = ".ci_support/*,.azure-pipelines/*,azure-pipelines.yml,.scripts/*,.gitattributes,.gitignore,LICENSE.txt,README.md"
 
 CONFLICT_START = re.compile(r"^<{7}(?: |$)")
 CONFLICT_BASE = re.compile(r"^\|{7}(?: |$)")
@@ -66,6 +68,32 @@ def git(*args):
 def conflicted_paths():
     out = git("diff", "--name-only", "--diff-filter=U")
     return [p for p in out.splitlines() if p.strip()]
+
+
+def matches(path, patterns):
+    """Exact match or fnmatch glob. fnmatch's `*` spans `/`, which is what we
+    want for prefixes like `.ci_support/*`."""
+    return any(path == p or fnmatch.fnmatch(path, p) for p in patterns)
+
+
+def take_whole_file(path, side):
+    """Resolve a conflict by taking one side's WHOLE file.
+
+    Used for conda-smithy generated files, where per-hunk resolution is
+    pointless because a rerender overwrites the file wholesale. Also the only
+    way to handle modify/delete conflicts: `git checkout --<side>` fails when
+    that side deleted the file, so fall back to removing it.
+
+    Returns True if the file was REMOVED rather than checked out, so the
+    caller knows not to `git add` a path that no longer exists.
+    """
+    try:
+        git("checkout", f"--{side}", "--", path)
+        git("add", "--", path)
+        return False
+    except subprocess.CalledProcessError:
+        git("rm", "-f", "--", path)
+        return True
 
 
 def resolve_hunks(text, side):
@@ -147,16 +175,24 @@ def cmd_capture(args):
 def cmd_resolve(args):
     identity = json.loads(Path(args.identity).read_text())
     recipe_path = args.recipe
-    take_theirs = {p for p in args.theirs.split(",") if p.strip()}
-    take_ours = {p for p in args.ours.split(",") if p.strip()}
+    take_theirs = [p.strip() for p in args.theirs.split(",") if p.strip()]
+    take_ours = [p.strip() for p in args.ours.split(",") if p.strip()]
+    regenerated = [p.strip() for p in args.regenerated.split(",") if p.strip()]
 
     conflicts = conflicted_paths()
-    resolved, unresolved = [], []
+    resolved, unresolved, removed = [], [], []
 
     for path in conflicts:
-        if path == recipe_path or path in take_theirs:
+        # Generated files first: a rerender overwrites them, so take upstream's
+        # whole file rather than merging hunks nobody will read.
+        if path != recipe_path and matches(path, regenerated):
+            if take_whole_file(path, "theirs"):
+                removed.append(path)
+            resolved.append(path)
+            continue
+        if path == recipe_path or matches(path, take_theirs):
             side = "theirs"
-        elif path in take_ours:
+        elif matches(path, take_ours):
             side = "ours"
         else:
             unresolved.append(path)
@@ -221,6 +257,11 @@ def cmd_resolve(args):
             resolved.append(recipe_path)
 
     for path in resolved:
+        if path in removed:
+            # `git rm` already staged the deletion. `git add` on a path that
+            # exists in neither the worktree nor the index is a fatal
+            # pathspec error, and git add has no --ignore-unmatch.
+            continue
         git("add", "--", path)
 
     if resolved:
@@ -260,6 +301,12 @@ def main():
         "--ours",
         default=DEFAULT_OURS,
         help="comma-separated paths to resolve in favour of rc",
+    )
+    p_res.add_argument(
+        "--regenerated",
+        default=DEFAULT_REGENERATED,
+        help="comma-separated globs for conda-smithy generated files: resolved "
+        "whole-file to upstream, then overwritten by the rerender",
     )
     p_res.set_defaults(func=cmd_resolve)
 
