@@ -81,6 +81,12 @@ jobs:
         with:
           python-version: '3.12'
 
+      # sync_rc.py does not use `packaging` itself, but it imports helpers from
+      # bump_rc.py, which imports packaging.version at module top level.
+      - name: Install packaging
+        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0'
+        run: python3 -m pip install --upgrade packaging
+
       - name: Capture rc identity before merging
         if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0'
         working-directory: rc
