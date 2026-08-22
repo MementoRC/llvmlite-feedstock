@@ -9,15 +9,24 @@ handful of fields that make rc the rc branch.
 Two subcommands, driven by .github/workflows/rc-sync.yml:
 
   capture   Read rc's recipe.yaml BEFORE the merge and record identity fields
-            (version, sha256, build_number) to a JSON file.
+            (version, sha256, build_number) plus any --preserve blocks
+            (default source.patches) to a JSON file.
+
+            Blocks matter because recipe.yaml is resolved per-hunk "theirs":
+            rc-only content such as its patches list lives INSIDE those hunks
+            and would otherwise be silently reverted to main's on every sync.
   resolve   After `git merge --no-commit upstream/main` has left conflicts,
             resolve the known-safe set and report anything else as unresolved.
 
 Resolution table:
 
   <recipe>                        theirs, then re-inject captured identity
-  --theirs paths (default         theirs (conda-smithy generated; a rerender
-  README.md)                      re-injects the rc channel label)
+  --theirs paths (default         theirs, PER HUNK. README.md is regenerated
+  README.md,conda-forge.yml)      by a rerender anyway; conda-forge.yml is a
+                                  rerender INPUT, so it must be merged rather
+                                  than taken whole-file.
+  --regenerated globs             theirs, WHOLE FILE (conda-smithy output;
+                                  the rerender overwrites it immediately)
   --ours paths (default           ours   (channel_targets: conda-forge
   recipe/conda_build_config.yaml) llvmlite_rc is rc's entire purpose)
   anything else                   left conflicted and reported
@@ -48,9 +57,10 @@ from bump_rc import (  # noqa: E402
 )
 
 DEFAULT_RECIPE = "recipe/recipe.yaml"
-DEFAULT_THEIRS = "README.md"
+DEFAULT_THEIRS = "README.md,conda-forge.yml"
 DEFAULT_OURS = "recipe/conda_build_config.yaml"
-DEFAULT_REGENERATED = ".ci_support/*,.azure-pipelines/*,azure-pipelines.yml,.scripts/*,.gitattributes,.gitignore,LICENSE.txt,README.md"
+DEFAULT_REGENERATED = ".ci_support/*,.azure-pipelines/*,azure-pipelines.yml,.scripts/*,.github/workflows/conda-build.yml,pixi.toml,.gitattributes,.gitignore,LICENSE.txt,README.md"
+DEFAULT_PRESERVE = "source.patches"
 
 CONFLICT_START = re.compile(r"^<{7}(?: |$)")
 CONFLICT_BASE = re.compile(r"^\|{7}(?: |$)")
@@ -74,6 +84,67 @@ def matches(path, patterns):
     """Exact match or fnmatch glob. fnmatch's `*` spans `/`, which is what we
     want for prefixes like `.ci_support/*`."""
     return any(path == p or fnmatch.fnmatch(path, p) for p in patterns)
+
+
+def _find_block(lines, dotted):
+    """Locate a nested block by dotted key path, e.g. "source.patches".
+
+    Returns (start, end) as a half-open line range covering the key line and
+    every following line indented deeper than it, or None if not found.
+    Line-based on purpose: see the module docstring.
+    """
+    keys = dotted.split(".")
+    lo, hi = 0, len(lines)
+    indent = -1
+    start = None
+    for key in keys:
+        start = None
+        for i in range(lo, hi):
+            line = lines[i]
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            cur = len(line) - len(line.lstrip())
+            m = re.match(r"^(\s*)" + re.escape(key) + r":", line)
+            if m and len(m.group(1)) > indent:
+                start = i
+                indent = len(m.group(1))
+                break
+        if start is None:
+            return None
+        end = hi
+        for j in range(start + 1, hi):
+            line = lines[j]
+            if not line.strip():
+                continue
+            cur = len(line) - len(line.lstrip())
+            if cur <= indent:
+                end = j
+                break
+        else:
+            end = hi
+        lo, hi = start + 1, end
+    return (start, end)
+
+
+def replace_block(lines, dotted, block):
+    """Replace the block at `dotted` with `block` (a list of raw lines).
+
+    Returns True on success. If the key is absent but its PARENT exists, the
+    block is inserted at the end of the parent instead -- upstream dropping the
+    key entirely must not silently discard rc's version of it.
+    """
+    span = _find_block(lines, dotted)
+    if span is not None:
+        lines[span[0]:span[1]] = block
+        return True
+    parent = dotted.rsplit(".", 1)[0]
+    if parent == dotted:
+        return False
+    pspan = _find_block(lines, parent)
+    if pspan is None:
+        return False
+    lines[pspan[1]:pspan[1]] = block
+    return True
 
 
 def take_whole_file(path, side):
@@ -166,9 +237,23 @@ def cmd_capture(args):
             sha256 = m.group(1)
             break
 
-    identity = {"version": version, "sha256": sha256, "build_number": build_number}
+    preserve = [p.strip() for p in args.preserve.split(",") if p.strip()]
+    blocks = {}
+    for dotted in preserve:
+        span = _find_block(lines, dotted)
+        if span is not None:
+            blocks[dotted] = lines[span[0]:span[1]]
+
+    identity = {
+        "version": version,
+        "sha256": sha256,
+        "build_number": build_number,
+        "blocks": blocks,
+    }
     Path(args.out).write_text(json.dumps(identity, indent=2))
-    print(f"captured rc identity: {identity}")
+    summary = {k: v for k, v in identity.items() if k != "blocks"}
+    summary["blocks"] = {k: len(v) for k, v in blocks.items()}
+    print(f"captured rc identity: {summary}")
     return 0
 
 
@@ -239,6 +324,13 @@ def cmd_resolve(args):
         if template_distinfo_glob(lines, args.package):
             notes.append("dist-info glob")
 
+        for dotted, block in (identity.get("blocks") or {}).items():
+            if replace_block(lines, dotted, block):
+                n = sum(1 for line in block if re.match(r"^\s*-\s+\S+\.patch\s*$", line))
+                notes.append(f"{dotted}({n})" if n else dotted)
+            else:
+                failed.append(dotted)
+
         if failed:
             # Fail loudly rather than shipping main's identity onto rc: the
             # result would be a buildable recipe publishing the wrong version
@@ -285,6 +377,7 @@ def main():
 
     p_cap = sub.add_parser("capture", help="record rc identity before merging")
     p_cap.add_argument("--recipe", default=DEFAULT_RECIPE)
+    p_cap.add_argument("--preserve", default=DEFAULT_PRESERVE)
     p_cap.add_argument("--out", required=True)
     p_cap.set_defaults(func=cmd_capture)
 
