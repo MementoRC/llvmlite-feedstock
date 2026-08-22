@@ -133,8 +133,11 @@ jobs:
       # Generated files were resolved whole-file to upstream above; the rerender
       # now regenerates them from conda-forge.yml + the recipe, which is what
       # makes those conflicts harmless rather than something to hand-merge.
+      # Skipped when conflicts remain unresolved: the tree still has conflict
+      # markers, conda-smithy cannot parse them, and the job would die instead
+      # of producing the intended draft [ci skip] PR.
       - name: Set up conda for rerender
-        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0'
+        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0' && steps.resolve.outputs.conflicted != 'true'
         uses: conda-incubator/setup-miniconda@v3
         with:
           miniforge-version: latest
@@ -142,7 +145,7 @@ jobs:
           auto-activate-base: false
 
       - name: Rerender with conda-smithy
-        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0'
+        if: steps.guard.outputs.needed == 'true' && steps.existing.outputs.open == '0' && steps.resolve.outputs.conflicted != 'true'
         working-directory: rc
         shell: bash -el {0}
         run: |
