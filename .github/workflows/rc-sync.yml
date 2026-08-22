@@ -70,9 +70,25 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.CF_FEEDSTOCK_PAT }}
         run: |
-          COUNT=$(gh pr list --repo "$UPSTREAM" --base "$RC_BRANCH" \
-                    --head "sync-main-to-rc/${MAIN_SHA}" \
-                    --state open --json number --jq 'length')
+          # This guard wedged every sync on 2026-08-22: it produced a value that
+          # was not '0' while no PR was actually open, so every later step stayed
+          # skipped and the job still reported success. MAIN_SHA only changes when
+          # conda-forge merges something, so the block was silent and permanent.
+          # Treat anything unparseable as "no PR open": a duplicate is already
+          # harmless (the push is --force to a fixed branch name and `gh pr create`
+          # no-ops when a PR exists), whereas a wrong skip stalls the pipeline.
+          RAW="$(gh pr list --repo "$UPSTREAM" --base "$RC_BRANCH" \
+                   --head "sync-main-to-rc/${MAIN_SHA}" \
+                   --state open --json number 2>&1 || true)"
+          echo "gh pr list raw output: [${RAW}]"
+          COUNT="$(printf '%s' "$RAW" | jq 'length' 2>/dev/null || true)"
+          case "$COUNT" in
+            '' | *[!0-9]*)
+              echo "::warning::could not parse an open-PR count from gh; treating as 0"
+              COUNT=0
+              ;;
+          esac
+          echo "open=$COUNT"
           echo "open=$COUNT" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
