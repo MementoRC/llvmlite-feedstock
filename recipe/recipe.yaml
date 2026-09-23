@@ -1,7 +1,7 @@
 schema_version: 1
 
 context:
-  build_number: 2
+  build_number: 4
   name: "llvmlite"
   version: "0.49.0"
 
@@ -43,7 +43,7 @@ requirements:
     - python
     - setuptools
     - llvmdev 22.*          # abstract pin for static lib
-    - llvmdev ==22.1.8 *_2  # concrete pin for static lib - bot should update
+    - llvmdev ==22.1.8 *_3  # concrete pin for static lib - bot should update
     - zlib
     - zstd
   run:
@@ -53,8 +53,13 @@ tests:
   - package_contents:
       strict: true
       files:
-        - ${{ "lib/python*" if unix else "Lib" }}/site-packages/llvmlite-${{ version }}.dist-info/*
-        - ${{ "lib/python*" if unix else "Lib" }}/site-packages/llvmlite/*
+        - if: match(python, ">=3.15") and win
+          then:
+            - lib/python/site-packages/llvmlite-${{ version }}.dist-info/*
+            - lib/python/site-packages/llvmlite/*
+          else:
+            - ${{ "lib/python*" if unix else "Lib" }}/site-packages/llvmlite-${{ version }}.dist-info/*
+            - ${{ "lib/python*" if unix else "Lib" }}/site-packages/llvmlite/*
   - python:
       imports:
         - llvmlite
