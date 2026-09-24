@@ -59,13 +59,45 @@ jobs:
           python3 "${GITHUB_WORKSPACE}/scaffold/.github/scripts/bump_rc.py" \
             rc/recipe/recipe.yaml --package "$PACKAGE"
 
+      - name: Skip if a bump PR for this version is already open
+        id: existing
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CF_FEEDSTOCK_PAT }}
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+        run: |
+          BRANCH="rc-bump/${NEW_VERSION}"
+          # Fail SAFE, and note this is the OPPOSITE bias to rc-sync.yml's
+          # equivalent guard. There a spurious "no PR open" was harmless. Here
+          # it would force-push over a branch a human is editing, so anything
+          # unparseable or errored must be treated as "a PR exists" and skip.
+          #
+          # Matching on headRefName rather than `gh pr list --head`: --head is
+          # ambiguous for a cross-fork PR (the API wants owner:ref) and a silent
+          # non-match here destroys work.
+          RAW="$(gh pr list --repo "$UPSTREAM" --base "$RC_BRANCH" \
+                   --state open --json headRefName,number 2>&1)" || RAW="ERROR"
+          echo "gh pr list raw: [${RAW}]"
+          COUNT="$(printf '%s' "$RAW" \
+            | jq --arg b "$BRANCH" '[.[] | select(.headRefName == $b)] | length' 2>/dev/null)" || COUNT=""
+          case "$COUNT" in
+            '' | *[!0-9]*)
+              echo "::warning::could not determine an open-PR count; assuming one exists and skipping"
+              COUNT=1
+              ;;
+          esac
+          if [ "$COUNT" != "0" ]; then
+            echo "A PR for ${BRANCH} is already open - leaving it alone"
+          fi
+          echo "open=$COUNT" >> "$GITHUB_OUTPUT"
+
       - name: Dry run - show what would be committed
         if: steps.bump.outputs.changed == 'true' && inputs.dry_run
         working-directory: rc
         run: git diff
 
       - name: Open PR into conda-forge rc
-        if: steps.bump.outputs.changed == 'true' && !inputs.dry_run
+        if: steps.bump.outputs.changed == 'true' && steps.existing.outputs.open == '0' && !inputs.dry_run
         working-directory: rc
         env:
           GH_TOKEN: ${{ secrets.CF_FEEDSTOCK_PAT }}
