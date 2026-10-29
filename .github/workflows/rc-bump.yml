@@ -70,20 +70,24 @@ jobs:
           # Fail SAFE, and note this is the OPPOSITE bias to rc-sync.yml's
           # equivalent guard. There a spurious "no PR open" was harmless. Here
           # it would force-push over a branch a human is editing, so anything
-          # unparseable or errored must be treated as "a PR exists" and skip.
+          # unparseable or errored must never reach the push step. Fail the job
+          # rather than skip quietly: a green run that skipped hides a missed bump.
           #
           # Matching on headRefName rather than `gh pr list --head`: --head is
           # ambiguous for a cross-fork PR (the API wants owner:ref) and a silent
           # non-match here destroys work.
-          RAW="$(gh pr list --repo "$UPSTREAM" --base "$RC_BRANCH" \
-                   --state open --json headRefName,number 2>&1)" || RAW="ERROR"
+          if ! RAW="$(gh pr list --repo "$UPSTREAM" --base "$RC_BRANCH" \
+                        --state open --json headRefName,number 2>&1)"; then
+            echo "::error::gh pr list failed: ${RAW}"
+            exit 1
+          fi
           echo "gh pr list raw: [${RAW}]"
           COUNT="$(printf '%s' "$RAW" \
             | jq --arg b "$BRANCH" '[.[] | select(.headRefName == $b)] | length' 2>/dev/null)" || COUNT=""
           case "$COUNT" in
             '' | *[!0-9]*)
-              echo "::warning::could not determine an open-PR count; assuming one exists and skipping"
-              COUNT=1
+              echo "::error::could not determine an open-PR count for ${BRANCH}; not pushing"
+              exit 1
               ;;
           esac
           if [ "$COUNT" != "0" ]; then
